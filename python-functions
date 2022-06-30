@@ -1,0 +1,257 @@
+import pandas as pd
+import numpy as np
+import json
+from mlxtend.preprocessing import TransactionEncoder
+from mlxtend.frequent_patterns import association_rules
+from mlxtend.frequent_patterns import fpgrowth
+
+from .utils import jsonify_dataframe_column, melt_dataframe
+from .config.flow.constants import (ASSOCIATION_RULES_COLUMNS_RENAMINGS, ASSOCIATION_RULES_SCHEMA,
+                                    ASSOCIATION_RULES_SORT_COLUMNS, DISTINCT_ITEMSETS_SCHEMA,
+                                    ITEMSETS_SORT_COLUMNS, DEFAULT_INFINITE_VALUE, RULES_METRICS_COLUMNS)
+
+def encode_transactions(list_of_lists_of_co_occuring_items):
+    transactions_encoder = TransactionEncoder()
+    encoded_transactions_array = transactions_encoder.fit(list_of_lists_of_co_occuring_items).transform(list_of_lists_of_co_occuring_items)
+    encoded_transactions_df = pd.DataFrame(encoded_transactions_array, columns=transactions_encoder.columns_)
+    return encoded_transactions_df
+
+def extract_frequent_itemsets_information(frequent_itemsets_df):
+    itemsets = list(frequent_itemsets_df["itemsets"])
+    itemsets_supports = list(frequent_itemsets_df["support"])
+    total_itemsets = len(itemsets)
+    
+    df_itemsets_supports = pd.DataFrame({"itemset":itemsets, "itemset_support":itemsets_supports})
+    df_itemsets_supports["total_itemsets"] = total_itemsets
+    df_itemsets_supports["itemset"] = df_itemsets_supports["itemset"].apply(lambda x:list(x))
+    df_itemsets_supports["itemset_size"] = df_itemsets_supports["itemset"].apply(lambda x:len(x))
+    
+    dict_itemsets_support = {}
+    for support, itemset in zip(itemsets_supports, itemsets):
+        dict_itemsets_support[itemset] = support
+        
+    
+    return df_itemsets_supports, dict_itemsets_support
+
+def rename_association_rules_columns(df_association_rules):
+    dataframe_columns = df_association_rules.columns
+    renaming_rules = {"support":"rule_support"}
+    
+    if "antecedents" in dataframe_columns:
+        renaming_rules["antecedents"] = "antecedent"
+    if "consequents" in dataframe_columns:
+        renaming_rules["consequents"] = "consequent"
+    
+    df_association_rules.rename(renaming_rules, axis=1, inplace=True)
+    return df_association_rules
+
+def compute_association_rules_metrics_and_interpretation(df_association_rules, itemsets_support, confidence_threshold):
+    print("Computing association rules metrics and interpretation ...")
+    
+    for column in ["antecedent", "consequent"]:
+        column_to_compute = "{}_size".format(column)
+        df_association_rules[column_to_compute] = df_association_rules[column].apply(lambda x:len(x))
+        print("{} computed".format(column_to_compute))
+    
+    new_antecedent_list = []
+    new_consequent_list = []
+    
+    antecedent_support_list = []
+    consequent_support_list = []
+    confidence_list = []
+    lift_list = []
+    conviction_list = []
+    
+    support_interpretation_list = []
+    confidence_interpretation_list = []
+    lift_interpretation_list = []
+    conviction_interpretation_list = []
+    
+    print("Computing rules metrics ...")
+    for antecedent, consequent, rule_support in zip(df_association_rules["antecedent"],
+                                                    df_association_rules["consequent"],
+                                                    df_association_rules["rule_support"]):
+        
+        new_antecedent_list.append(list(antecedent))
+        new_consequent_list.append(list(consequent))
+        
+        antecedent_support = itemsets_support.get(antecedent)
+        antecedent_support_list.append(antecedent_support)
+        
+        consequent_support = itemsets_support.get(consequent)
+        consequent_support_list.append(consequent_support)
+                
+        confidence = rule_support / antecedent_support
+        confidence_list.append(confidence)
+        
+        lift = confidence / consequent_support
+        lift_list.append(lift)
+        
+        try:
+            conviction = (1 - consequent_support) / (1 - confidence)
+        except ZeroDivisionError:
+            conviction = DEFAULT_INFINITE_VALUE
+        conviction_list.append(conviction)
+        
+        support_interpretation, confidence_interpretation, lift_interpretation, conviction_interpretation = \
+        compute_metrics_interpretation(rule_support, confidence, lift, conviction)        
+        support_interpretation_list.append(support_interpretation)
+        confidence_interpretation_list.append(confidence_interpretation)
+        lift_interpretation_list.append(lift_interpretation)
+        conviction_interpretation_list.append(conviction_interpretation)
+        
+
+    print("Enriching association rules DataFrame ...")
+    df_association_rules["antecedent"] = new_antecedent_list
+    df_association_rules["consequent"] = new_consequent_list
+    df_association_rules["antecedent support"] = antecedent_support_list
+    df_association_rules["consequent support"] = consequent_support_list
+    df_association_rules["confidence"] = confidence_list
+    df_association_rules["lift"] = lift_list
+    df_association_rules["conviction"] = conviction_list
+    df_association_rules["support_interpretation"] = support_interpretation_list
+    df_association_rules["confidence_interpretation"] = confidence_interpretation_list
+    df_association_rules["lift_interpretation"] = lift_interpretation_list
+    df_association_rules["conviction_interpretation"] = conviction_interpretation_list
+    print("Association rules metrics and interpretation computed !")
+    return df_association_rules
+
+def get_support_interpretation(support, interpretation_context):
+    if interpretation_context == "flow":
+        antecedent_label = "antecedent"
+        consequent_label = "consequent"
+    elif interpretation_context == "webapp":
+        antecedent_label = "trigger"
+        consequent_label = "outcome"
+    support_interpretation = \
+    "The rule's support is '{:.4f}' : that means {} and {} itemsets "\
+    "occured together {:.4f} % of the time.\n".format(support, antecedent_label, consequent_label, 100*support)
+    return support_interpretation
+
+def get_confidence_interpretation(confidence, interpretation_context):
+    if interpretation_context == "flow":
+        antecedent_label = "antecedent"
+        consequent_label = "consequent"
+    elif interpretation_context == "webapp":
+        antecedent_label = "trigger"
+        consequent_label = "outcome"
+        
+    confidence_interpretation = \
+    "Knowing the {} is bought "\
+    "the {} itemset is likely to be also bought  {:.3f} % of the time. "\
+    .format(antecedent_label, consequent_label, 100*confidence)
+    return confidence_interpretation
+
+def get_lift_or_conviction_position(lift_or_conviction):
+    if lift_or_conviction > 1:
+        return "above"
+    elif lift_or_conviction ==1:
+        return "equal to"
+    else:
+        return "below"
+
+def get_lift_interpretation(lift, interpretation_context):
+    if interpretation_context == "flow":
+        consequent_label = "consequent"
+    elif interpretation_context == "webapp":
+        consequent_label = "outcome"
+        
+    log_message = "With a lift {} 1 : using the rule seems to ".format(get_lift_or_conviction_position(lift))
+    if lift > 1:
+        log_message+= "INCREASE "
+        log_message_end = "The further it is from '1' the most powerful is the rule.\n"
+    elif lift <=1 :
+        log_message+= "have NO EFFECT on "
+        log_message_end = ""
+    log_message+= "the likelihood to purchase the {} itemset. ".format(consequent_label) + log_message_end
+    return log_message
+
+def get_conviction_interpretation(conviction, interpretation_context):
+    if interpretation_context == "flow":
+        antecedent_label = "antecedent"
+        consequent_label = "consequent"
+    elif interpretation_context == "webapp":
+        antecedent_label = "trigger"
+        consequent_label = "outcome"
+    log_message =  "With a conviction {} 1 : the {} itemset seems to be ".format(get_lift_or_conviction_position(conviction), consequent_label)
+    if conviction > 1:
+        log_message+= "DEPENDANT on "
+        log_message_end = "The further it is from '1' the higher is the dependance.\n"
+    elif conviction <=1 :
+        log_message+= "INdependant from "
+        log_message_end = "The closer it is to '0' the worse is the dependance.\n"
+    log_message+= "the {} itemset. ".format(antecedent_label) + log_message_end
+    return log_message
+
+
+def compute_metrics_interpretation(support, confidence, lift, conviction):
+    interpretation_context = "flow"
+    support_interpretation = get_support_interpretation(support, interpretation_context)
+    confidence_interpretation = get_confidence_interpretation(confidence, interpretation_context)
+    lift_interpretation = get_lift_interpretation(lift, interpretation_context)
+    conviction_interpretation = get_conviction_interpretation(conviction, interpretation_context)
+    return support_interpretation, confidence_interpretation, lift_interpretation, conviction_interpretation
+
+def get_default_rules_and_items_dataframes():
+    df_association_rules = pd.DataFrame(columns=ASSOCIATION_RULES_SCHEMA)
+    df_itemsets_supports = pd.DataFrame(columns=DISTINCT_ITEMSETS_SCHEMA)
+    return df_association_rules, df_itemsets_supports
+    
+def compute_association_rules(dataframe,
+                              transaction_items_column,
+                              itemsets_min_support,
+                              max_itemsets_size,
+                              confidence_threshold):
+    
+    encoded_transactions_df = encode_transactions(dataframe[transaction_items_column])
+    print("Looking for frequent itemsets ...")
+    frequent_itemsets_df = fpgrowth(encoded_transactions_df, min_support=itemsets_min_support,
+                                    use_colnames=True, max_len=max_itemsets_size)
+    
+    no_frequent_itemsets_found = frequent_itemsets_df.empty
+    
+    if no_frequent_itemsets_found:
+        print("No frequent itemsets found : try to decrease the 'itemsets_min_support' parameter.")
+        association_rules_found = False
+        df_association_rules, df_itemsets_supports = get_default_rules_and_items_dataframes()
+        
+    else:
+        df_itemsets_supports, itemsets_support = \
+        extract_frequent_itemsets_information(frequent_itemsets_df)
+
+        print("Looking for association rules ...")
+        df_association_rules = association_rules(frequent_itemsets_df,
+                                                 metric="support",
+                                                 min_threshold=itemsets_min_support,
+                                                 support_only=True)
+        
+        association_rules_found = not df_association_rules.empty
+        print("Association rules {} found !".format("SUCCESSFULLY" if association_rules_found else "NOT"))
+        
+        if association_rules_found:
+            df_association_rules = rename_association_rules_columns(df_association_rules)
+            df_association_rules = compute_association_rules_metrics_and_interpretation(df_association_rules, itemsets_support, confidence_threshold)
+            df_itemsets_supports.sort_values(by=ITEMSETS_SORT_COLUMNS, ascending=False, inplace=True)
+            df_itemsets_supports = df_itemsets_supports[DISTINCT_ITEMSETS_SCHEMA]
+
+            df_association_rules.rename(ASSOCIATION_RULES_COLUMNS_RENAMINGS, axis=1, inplace=True)
+            df_association_rules.sort_values(by=ASSOCIATION_RULES_SORT_COLUMNS, ascending=False, inplace=True)
+
+            df_association_rules = df_association_rules[ASSOCIATION_RULES_SCHEMA]
+
+            for column in RULES_METRICS_COLUMNS:
+                df_association_rules[column] = df_association_rules[column].astype(float)
+        else:
+            df_association_rules, df_itemsets_supports = get_default_rules_and_items_dataframes()
+    
+    return association_rules_found, df_association_rules, df_itemsets_supports
+
+def melt_from_rules_to_items_recommendation(dataframe_association_rules):
+    dataframe_association_rules["rule_consequent"] = \
+    dataframe_association_rules["rule_consequent"].str.replace("'", '"')
+    dataframe_association_rules["rule_consequent"] = \
+    dataframe_association_rules["rule_consequent"].apply(lambda x: json.loads(x))
+    dataframe_association_rules = melt_dataframe(dataframe_association_rules,
+                                                 "rule_consequent",
+                                                 {"rule_consequent":"item_recommendation"})
+    return dataframe_association_rules
